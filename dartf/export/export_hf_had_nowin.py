@@ -50,4 +50,9 @@ _orig_fp = Sam3Model.from_pretrained.__func__
 def _fp(cls, *a, **k):
     mm = _orig_fp(cls, *a, **k); prepare_both(mm.vision_encoder.backbone); return mm
 Sam3Model.from_pretrained = _fp
-os.makedirs(out, exist_ok=True); print("export_onnx returned:", E.export_onnx(out, imgsz=imgsz))
+_B = int(os.environ.get("LQ_BATCH", "1"))          # batch size baked into the exported graph (static shapes); the weights / calibration / GPTQ results do not depend on it
+if _B > 1:
+    _orig_randn = torch.randn
+    def _randn(*a, **k): return _orig_randn(_B, *a[1:], **k) if len(a) == 4 and a[0] == 1 and a[1] == 3 else _orig_randn(*a, **k)
+    torch.randn = _randn
+os.makedirs(out, exist_ok=True); print("export_onnx returned:", E.export_onnx(out, imgsz=imgsz), "| batch", _B)

@@ -13,7 +13,7 @@ import tensorrt as trt
 from scipy.optimize import linear_sum_assignment
 from trt_util import load_engine, Runner, TRT_LOGGER, NP_DTYPE
 NP_DTYPE = dict(NP_DTYPE); NP_DTYPE[trt.int64] = np.int64
-from cuda_alloc import DevBuf, Stream, Event, PinnedBuf, memcpy_async, H2D
+from cuda_alloc import DevBuf, Stream, Event, PinnedBuf, memcpy_async, H2D, D2D
 import threading, queue
 from tokenize_classes import Sam3Tokenizer, CONTEXT_LENGTH, BUCKET
 from PIL import Image, ImageDraw, ImageFont
@@ -56,7 +56,7 @@ ap.add_argument("--refresh-max", type=int, default=24, help="optional change-gat
 ap.add_argument("--sam3-budget", type=int, default=4, help="max objects propagated per frame"); ap.add_argument("--sam3-v1", action="store_true", help="use the first-generation trk_step engine instead of trk_step_v2 (gathered keys, default when the v2 plan exists)"); ap.add_argument("--sam3-prune", type=int, default=4, help="v2: keep memory keys within this dilation (72-grid cells) of the object mask plus a background grid; 0 = all keys"); ap.add_argument("--sam3-adaptive", action="store_true", help="3 memory frames for stable objects, 7 otherwise"); ap.add_argument("--sam3-mem", type=int, default=7, help="max memory frames per step (conditioning + recent)"); ap.add_argument("--sam3-min-hits", type=int, default=None, help="track confirmation: consecutive matched detections before a track is shown (default 3 for --tracker sam3, SAM3's masklet confirmation; 8 for hybrid)"); ap.add_argument("--sam3-min-iou", type=float, default=0.0, help="stop propagating a track once the predicted mask IoU falls below this")
 ap.add_argument("--sam3-qprune", type=int, default=0, help="optional query-side pruning (off by default, changes the step): with trk_step_v3, only queries within this many cells of the object mask get the memory update"); ap.add_argument("--sam3-qgrid", type=int, default=0, help="v3 engines: background query grid stride (0 = none)"); ap.add_argument("--sam3-qfull", type=int, default=0, help="v3 engines: run a full (all-query) step every this many steps per object; its object score is carried through the pruned steps (0 = never)")
 ap.add_argument("--stats", default=None); ap.add_argument("--snap", default=None); ap.add_argument("--mot-out", default=None, help="write MOT-format tracks (frame,id,x,y,w,h,conf,-1,-1,-1) at the source resolution; with --no-render no video is written")
-ap.add_argument("--no-render", action="store_true"); ap.add_argument("--pipeline", action="store_true", help="two-stream frame pipeline: decode/preprocess in a thread, the backbone of frame t+1 runs on its own CUDA stream while the head, tracker and renderer process frame t"); ap.add_argument("--mot-box", choices=["det", "mask"], default="det", help="box written to --mot-out: the detector box (smoothed) or the mask extent"); ap.add_argument("--src-size", default=None, help="WxH of the source frames (image sequences)"); ap.add_argument("--fps-in", type=float, default=None, help="frame rate of an image-sequence input"); ap.add_argument("--no-lower-third", action="store_true"); ap.add_argument("--lt-slide", action="store_true", help="slide the lower third in (first clip); otherwise it fades in")
+ap.add_argument("--text-cache", default=None, help="text-embedding cache (.npz); default assets/text_<prompts>.npz. Computed once per prompt set (python demo/text_cache.py \"a,b\"), then the text encoder is never loaded"); ap.add_argument("--gpu-decode", action="store_true", help="image input (sequence pattern, directory or glob; headless, needs --no-render): decode JPEGs with nvJPEG, resize and normalize on the GPU in a prefetch thread, off the inference path"); ap.add_argument("--no-render", action="store_true"); ap.add_argument("--pipeline", action="store_true", help="two-stream frame pipeline: decode/preprocess in a thread, the backbone of frame t+1 runs on its own CUDA stream while the head, tracker and renderer process frame t"); ap.add_argument("--mot-box", choices=["det", "mask"], default="det", help="box written to --mot-out: the detector box (smoothed) or the mask extent"); ap.add_argument("--src-size", default=None, help="WxH of the source frames (image sequences)"); ap.add_argument("--fps-in", type=float, default=None, help="frame rate of an image-sequence input"); ap.add_argument("--no-lower-third", action="store_true"); ap.add_argument("--lt-slide", action="store_true", help="slide the lower third in (first clip); otherwise it fades in")
 ap.add_argument("--duration", type=float, default=15.0, help="seconds of source video to process"); ap.add_argument("--no-swipe", action="store_true", help="disable the with/without wipe")
 ap.add_argument("--lt-in", type=float, default=0.5); ap.add_argument("--lt-out", type=float, default=8.0)
 a = ap.parse_args()
@@ -77,13 +77,8 @@ FONT_LAB = F("Semibold", 26); FONT_LAB_S = F("Semibold", 21); FONT_T1 = F("Bold"
 prompts = [p.strip() for p in a.prompts.split(",") if p.strip()]; K = len(prompts); assert 1 <= K <= 16
 
 # ---- text encoder: once per prompt set (onnxruntime CPU; rows are independent, so slicing to K is exact) ----
-cache = os.path.join(a.assets, "text_" + "_".join(p.replace(" ", "-") for p in prompts) + ".npz")
-if os.path.exists(cache): z = np.load(cache); tf, tm = z["tf"], z["tm"]
-else:
-    import onnxruntime as ort
-    tok = Sam3Tokenizer(a.bpe); ids = np.zeros((BUCKET, CONTEXT_LENGTH), np.int32); ids[:, 0] = 49406; ids[:, 1] = 49407
-    for i, p in enumerate(prompts): e = tok.encode(p); ids[i, :] = 0; ids[i, :len(e)] = e
-    sess = ort.InferenceSession(a.text_onnx, providers=["CPUExecutionProvider"]); tf, tm = sess.run(None, {"token_ids": ids}); np.savez(cache, tf=tf, tm=tm)
+from text_cache import text_embeddings, default_cache
+tf, tm = text_embeddings(prompts, a.text_onnx, a.bpe, a.text_cache or default_cache(a.assets, prompts))
 tfK = np.ascontiguousarray(tf[:, :K, :]).astype(np.float16); tmK = np.ascontiguousarray(tm[:K]).astype(np.float32)
 
 # ---- engines ----
@@ -94,7 +89,7 @@ else: ground = Runner(load_engine(a.ground)); KB = int(ground.bufs["img_feat"][1
 assert K <= KB, f"{K} prompts but the head bucket is {KB}"; assert img_pos.shape[0] == KB, "img_pos does not match the head bucket"
 tf4 = np.ascontiguousarray(tf[:, :KB, :]).astype(np.float16); tm4 = np.ascontiguousarray(tm[:KB]).astype(np.float32)
 for i in range(K, KB): tm4[i, :] = tm[BUCKET - 1]; tf4[:, i, :] = tf[:, BUCKET - 1, :]                 # padded rows: empty prompt
-fpn0_name, fpn1_name = vision.alias.get("fpn_0", "fpn_0"), vision.alias.get("fpn_1", "fpn_1")
+fpn0_name, fpn1_name, fpn2_name = vision.alias.get("fpn_0", "fpn_0"), vision.alias.get("fpn_1", "fpn_1"), vision.alias.get("fpn_2", "fpn_2")   # engines with other output names (e.g. the DART FP16 backbone: conv2d_*)
 class DynRunner:
     def __init__(self, engine):
         self.engine = engine; self.ctx = engine.create_execution_context(); self.names = [engine.get_tensor_name(i) for i in range(engine.num_io_tensors)]
@@ -116,7 +111,7 @@ mask = None
 if a.heads == "masks":
     if a.groundmask: fused = DynRunner(fused_eng)
     mask = fused if a.groundmask else DynRunner(load_engine(a.mask)); mask.bind("fpn_0", vision.bufs[fpn0_name][0].ptr, tuple(vision.bufs[fpn0_name][1])); mask.bind("fpn_1", vision.bufs[fpn1_name][0].ptr, tuple(vision.bufs[fpn1_name][1]))
-    if a.groundmask: mask.bind("fpn_2", vision.bufs["fpn_2"][0].ptr, tuple(vision.bufs["fpn_2"][1]))
+    if a.groundmask: mask.bind("fpn_2", vision.bufs[fpn2_name][0].ptr, tuple(vision.bufs[fpn2_name][1]))
 
 # ---- tracker: mask IoU Hungarian matching, low score continuation, coasting, EMA smoothing, class voting ----
 dev = torch.device("cuda")
@@ -255,6 +250,13 @@ def sigmoid(x): return 1 / (1 + np.exp(-x.astype(np.float64)))
 def ease(x): x = max(0.0, min(1.0, x)); return x * x * (3 - 2 * x)
 
 # ---- video I/O ----
+img_list = None
+if a.gpu_decode:
+    from gpu_frames import list_images, GpuFrameSource
+    assert HAVE_TORCH, "--gpu-decode needs torch with CUDA"; assert a.no_render, "--gpu-decode is for headless image input: add --no-render"
+    img_list = list_images(a.video); assert img_list, f"no images found for {a.video}"
+    if not a.fps_in: a.fps_in = 30.0
+    if not a.src_size: a.src_size = "x".join(str(v) for v in Image.open(img_list[0]).size)
 if a.fps_in: src_fps = a.fps_in; n_frames = 0
 else:
     probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate,nb_frames", "-of", "csv=p=0", a.video], capture_output=True, text=True).stdout.strip().split(",")
@@ -286,7 +288,8 @@ class ImageReader:
     @property
     def stdout(self): return self._out
     def kill(self): pass
-if is_image:
+if img_list is not None: dec_m = None                                             # frames come from the GPU source below
+elif is_image:
     _ir = ImageReader(a.video); dec_m = _ir; dec_m._out = ImageReader._P(_ir.model)
     OW, OH = (_ir.orig.width // 2) * 2, (_ir.orig.height // 2) * 2; src_fps = 1.0; n_frames = 1
 else: dec_m = SeqReader(a.video) if is_seq else subprocess.Popen(["ffmpeg", "-v", "error", "-i", a.video, "-vf", "scale=1008:1008:flags=bilinear", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE, bufsize=10 ** 8)
@@ -300,9 +303,12 @@ class PipelinedVision:
     def __init__(self, runner):
         eng = runner.engine; self.ctx = eng.create_execution_context(); self.stream = Stream(); self.in_name = runner.inputs[0]; self.outs = runner.outputs; self.shapes = {n: runner.bufs[n][1] for n in runner.names}; self.dts = {n: runner.bufs[n][2] for n in runner.names}
         nb = lambda n: int(np.prod(self.shapes[n])) * np.dtype(self.dts[n]).itemsize
-        self.sets = [{n: DevBuf(nb(n)) for n in self.outs} for _ in range(2)]; self.inp = [DevBuf(nb(self.in_name)) for _ in range(2)]; self.pinned = [PinnedBuf(self.shapes[self.in_name], self.dts[self.in_name]) for _ in range(2)]; self.events = [Event(), Event()]
+        self.sets = [{n: DevBuf(nb(n)) for n in self.outs} for _ in range(2)]; self.inp = [DevBuf(nb(self.in_name)) for _ in range(2)]; self.pinned = [PinnedBuf(self.shapes[self.in_name], self.dts[self.in_name]) for _ in range(2)]; self.events = [Event(), Event()]; self.hold = [None, None]
     def enqueue(self, t, x):
-        s = t % 2; np.copyto(self.pinned[s].arr, x); memcpy_async(self.inp[s].ptr, self.pinned[s].ptr, self.pinned[s].nbytes, H2D, self.stream)
+        s = t % 2
+        if hasattr(x, "data_ptr"):      # preprocessed frame already on the GPU: device-to-device; keep it referenced until this slot is consumed
+            assert x.is_cuda and x.is_contiguous() and x.numel() * x.element_size() == self.pinned[s].nbytes; self.hold[s] = x; memcpy_async(self.inp[s].ptr, x.data_ptr(), self.pinned[s].nbytes, D2D, self.stream)
+        else: np.copyto(self.pinned[s].arr, x); memcpy_async(self.inp[s].ptr, self.pinned[s].ptr, self.pinned[s].nbytes, H2D, self.stream)
         self.ctx.set_tensor_address(self.in_name, self.inp[s].ptr)
         for n in self.outs: self.ctx.set_tensor_address(n, self.sets[s][n].ptr)
         assert self.ctx.execute_async_v3(self.stream.ptr); self.events[s].record(self.stream)
@@ -314,9 +320,13 @@ def reader(q):
         bm = dec_m.stdout.read(1008 * 1008 * 3); bd = dec_d.stdout.read(OW * OH * 3) if dec_d else b""
         if len(bm) < 1008 * 1008 * 3 or (dec_d and len(bd) < OW * OH * 3) or (a.max_frames and fi >= a.max_frames) or (a.duration and fi >= int(a.duration * src_fps)): q.put(None); return
         q.put((preprocess(bm), bd)); fi += 1
+gsrc = GpuFrameSource(img_list, 1008, limit=a.max_frames) if img_list is not None else None       # decode + resize + normalize on the GPU, in a thread, ahead of the loop
 PV = PipelinedVision(vision) if a.pipeline else None
-if a.pipeline: fq = queue.Queue(maxsize=3); threading.Thread(target=reader, args=(fq,), daemon=True).start(); nxt = fq.get()
-stats = {"frames": 0, "vision_ms": [], "head_ms": [], "mask_ms": [], "tracks": [], "new_ids": [], "appear": []}; prev_shown = set()
+if a.pipeline:
+    if gsrc is not None: fq = gsrc.q
+    else: fq = queue.Queue(maxsize=3); threading.Thread(target=reader, args=(fq,), daemon=True).start()
+    nxt = fq.get()
+stats = {"frames": 0, "input_ms": [], "vision_ms": [], "head_ms": [], "mask_ms": [], "tracks": [], "new_ids": [], "appear": []}; prev_shown = set()
 XG = np.arange(OW)[None, :, None]
 src_dur = 0.0 if (a.no_render or a.fps_in or is_image) else float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", a.video], capture_output=True, text=True).stdout.strip() or 0)
 clip_len = min(a.duration, src_dur) if a.duration else src_dur; cycle = clip_len >= 13.0      # the off/on cycle needs 4 s and must finish 2 s before the cut
@@ -340,16 +350,23 @@ while True:
         if nxt is None: break
         x, bd = nxt
         if fi == 0: PV.enqueue(0, x[None])
-        t0 = time.perf_counter(); nxt = fq.get()
+        t0 = time.perf_counter(); nxt = fq.get(); t_in = time.perf_counter() - t0                  # time the loop waits for the next frame (decode is prefetched)
         if nxt is not None: PV.enqueue(fi + 1, nxt[0][None])                       # backbone of the next frame starts now, on its own stream
         bufset = PV.wait(fi); v = {} if a.groundmask else {"fpn_2": bufset["fpn_2"].download(PV.shapes["fpn_2"], PV.dts["fpn_2"])}; t1 = time.perf_counter()
         if mask is not None: mask.bind("fpn_0", bufset[fpn0_name].ptr, PV.shapes[fpn0_name]); mask.bind("fpn_1", bufset[fpn1_name].ptr, PV.shapes[fpn1_name])
-        if a.groundmask: mask.bind("fpn_2", bufset["fpn_2"].ptr, PV.shapes["fpn_2"])
+        if a.groundmask: mask.bind("fpn_2", bufset[fpn2_name].ptr, PV.shapes[fpn2_name])
         if trk is not None: trk.neck.bind("trunk", bufset["permute_4"].ptr, PV.shapes["permute_4"])
     else:
-        bm = dec_m.stdout.read(1008 * 1008 * 3); bd = dec_d.stdout.read(OW * OH * 3) if dec_d else b""
-        if len(bm) < 1008 * 1008 * 3 or (dec_d and len(bd) < OW * OH * 3) or (a.max_frames and fi >= a.max_frames) or (a.duration and fi >= int(a.duration * src_fps)): break
-        x = preprocess(bm)
+        ti = time.perf_counter()
+        if gsrc is not None:
+            item = gsrc.get()
+            if item is None: break
+            x, bd = item
+        else:
+            bm = dec_m.stdout.read(1008 * 1008 * 3); bd = dec_d.stdout.read(OW * OH * 3) if dec_d else b""
+            if len(bm) < 1008 * 1008 * 3 or (dec_d and len(bd) < OW * OH * 3) or (a.max_frames and fi >= a.max_frames) or (a.duration and fi >= int(a.duration * src_fps)): break
+            x = preprocess(bm)
+        t_in = time.perf_counter() - ti
         t0 = time.perf_counter(); v = vision({"images": x[None]}, want=[] if a.groundmask else ["fpn_2"]); DevBuf.sync(); t1 = time.perf_counter()
     g = fused({"text_feats": tf4, "text_mask": tm4}) if a.groundmask else ground({"img_feat": np.repeat(v["fpn_2"].astype(np.float16), KB, axis=0), "img_pos": img_pos, "text_feats": tf4, "text_mask": tm4}); DevBuf.sync(); t2 = time.perf_counter()
     probs = sigmoid(g["scores"][:K, :, 0]) * sigmoid(g["presence"][:K, 0])[:, None]
@@ -399,7 +416,7 @@ while True:
         for t in shown:
             x0, y0, x1, y1 = (mask_box(t) if (t.mask is not None and a.mot_box == "mask") else tuple(t.box)); mot_f.write(f"{fi + 1},{t.id},{x0 * SW / OW:.2f},{y0 * SH / OH:.2f},{(x1 - x0) * SW / OW:.2f},{(y1 - y0) * SH / OH:.2f},{t.p:.3f},-1,-1,-1\n")
     if a.no_render:
-        stats["vision_ms"].append((t1 - t0) * 1000); stats["head_ms"].append((t2 - t1) * 1000); stats["mask_ms"].append((t3 - t2) * 1000); stats["tracks"].append(len(shown)); stats["frames"] += 1; fi += 1
+        stats["vision_ms"].append((t1 - t0) * 1000); stats["head_ms"].append((t2 - t1) * 1000); stats["mask_ms"].append((t3 - t2) * 1000); stats["tracks"].append(len(shown)); stats["input_ms"].append(t_in * 1000); stats["frames"] += 1; fi += 1
         if fi % 200 == 0: print(f"{fi}/{n_frames}  backbone {np.mean(stats['vision_ms'][-200:]):.1f}  head {np.mean(stats['head_ms'][-200:]):.1f}  masks {np.mean(stats['mask_ms'][-200:]):.1f} ms  tracks {len(shown)}  {time.time() - t_start:.0f}s", flush=True)
         stats["new_ids"].append(tracker.next_id - n0); ids = {t.id for t in shown}; stats["appear"].append(len(ids - prev_shown)); prev_shown = ids
         continue
@@ -442,11 +459,13 @@ while True:
     if is_image: pil.convert("RGB").save(a.out)
     else: out = np.asarray(pil.convert("RGB")); enc.stdin.write(out.tobytes())
     if a.snap and fi == int(a.snap): pil.convert("RGB").save(a.out + f".frame{fi}.png")
-    stats["vision_ms"].append((t1 - t0) * 1000); stats["head_ms"].append((t2 - t1) * 1000); stats["mask_ms"].append((t3 - t2) * 1000); stats["tracks"].append(len(shown)); stats["frames"] += 1; fi += 1
+    stats["vision_ms"].append((t1 - t0) * 1000); stats["head_ms"].append((t2 - t1) * 1000); stats["mask_ms"].append((t3 - t2) * 1000); stats["tracks"].append(len(shown)); stats["input_ms"].append(t_in * 1000); stats["frames"] += 1; fi += 1
     if fi % 50 == 0: print(f"{fi}/{n_frames}  backbone {np.mean(stats['vision_ms'][-50:]):.1f}  head {np.mean(stats['head_ms'][-50:]):.1f}  masks {np.mean(stats['mask_ms'][-50:]):.1f} ms  tracks {len(shown)}  {time.time() - t_start:.0f}s", flush=True)
 if enc: enc.stdin.close(); enc.wait()
-dec_m.kill()
+if dec_m is not None: dec_m.kill()
 if dec_d: dec_d.kill()
 if mot_f: mot_f.close()
 summary = {"video": a.video, "prompts": prompts, "tracker": a.tracker, "heads": a.heads, "pipeline": a.pipeline, "frames": stats["frames"], "wall_ms_per_frame": (time.time() - t_start) * 1000 / max(1, stats["frames"]), "backbone_ms": float(np.mean(stats["vision_ms"])), "head_ms": float(np.mean(stats["head_ms"])), "mask_ms": float(np.mean(stats["mask_ms"])), **({"sam3_tracker_ms_per_frame": {k: v / max(1, stats["frames"]) for k, v in trk.t_ms.items()}, "sam3_refreshes": trk.n_init, "sam3_steps": trk.n_step, "sam3_step_calls": trk.n_step_calls, "sam3_drops": stats.get("sam3_drops", 0), **({"sam3_prof_ms_per_call": {k: v * 1000 / max(1, trk.n_step_calls) for k, v in trk.prof.items()}} if getattr(trk, "prof", None) else {}), "sam3_keys_fraction": trk.keys_used / max(1, trk.keys_full), "sam3_queries_fraction": (trk.q_used / max(1, trk.q_full)) if getattr(trk, "q_full", 0) else None} if trk else {}), "tracks_mean": float(np.mean(stats["tracks"])), "new_ids_per_frame_after_warmup": float(np.mean(stats["new_ids"][10:])) if len(stats["new_ids"]) > 10 else None, "tracks_appearing_per_frame": float(np.mean(stats["appear"][10:])) if len(stats["appear"]) > 10 else None, "src_fps": src_fps}
+summary["input_wait_ms"] = float(np.mean(stats["input_ms"])) if stats["input_ms"] else 0.0
+if gsrc is not None: summary["gpu_decode_ms"] = float(np.mean(gsrc.decode_ms)) if gsrc.decode_ms else 0.0; summary["gpu_decode_fallbacks"] = gsrc.fallbacks
 print(json.dumps(summary)); json.dump(summary, open(a.stats or a.out + ".json", "w"), indent=1)

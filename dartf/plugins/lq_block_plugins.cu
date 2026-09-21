@@ -507,7 +507,7 @@ class LQQkvPlugin : public IPluginV3, public IPluginV3OneCore, public IPluginV3O
 public:
     QkvParams p; float* dG = nullptr; float* dB = nullptr; __half* dTab = nullptr; int tabM = 0;
     explicit LQQkvPlugin(QkvParams pp) : p(std::move(pp)) {}
-    ~LQQkvPlugin() override { p.q.free(); p.k.free(); p.v.free(); if (dG) cudaFree(dG); if (dB) cudaFree(dB); if (dTab) cudaFree(dTab); }
+    ~LQQkvPlugin() override { p.q.free(); p.k.free(); p.v.free(); if (dG) cudaFree(dG); if (dB) cudaFree(dB); /* dTab is owned by the shared cache g_tabs (many plugin instances and later reloads use it): never free it here */ }
     LQ_COMMON_BUILD(3)
     int32_t getOutputShapes(DimsExprs const* in, int32_t, DimsExprs const*, int32_t, DimsExprs* out, int32_t nb, IExprBuilder&) noexcept override { for (int i = 0; i < nb; i++) out[i] = in[0]; return 0; }
     IPluginV3* clone() noexcept override { return new LQQkvPlugin(p); }
@@ -537,7 +537,7 @@ public:
 #ifdef LQ_BATCHED_TABLES   // variant: shared [Ntok, C] table, GEMMs batched over windows
         if (!dTab) { dTab = lqblk::packed_table(p.cosT, p.sinT, p.Ntok, p.Ntok, p.C); }
 #else                      // default: full [M, C] table replicated per window, one GEMM per projection
-        if (!dTab || tabM != (int)M) { if (dTab) cudaFree(dTab); dTab = lqblk::packed_table(p.cosT, p.sinT, p.Ntok, (int)M, p.C); tabM = (int)M; }
+        if (!dTab || tabM != (int)M) { dTab = lqblk::packed_table(p.cosT, p.sinT, p.Ntok, (int)M, p.C); tabM = (int)M; }      // cache-owned pointer: not freed by the plugin
 #endif
         const __half* x = (const __half*)inputs[0]; int8_t* x8 = (int8_t*)ws; char* gws = (char*)(x8 + (size_t)M * p.C);
         if (p.mode == 0) lqblk::norm_quant_kernel<0><<<(unsigned)((M + 7) / 8), 256, 0, st>>>(x, x8, dG, dB, p.eps, 1.f / p.s, (int)M);

@@ -5,7 +5,7 @@ import sys, os, json, time, argparse
 from pathlib import Path
 ap = argparse.ArgumentParser(); ap.add_argument("--dart", required=True, help="DART repository root (its sam3 package is imported)"); ap.add_argument("--ckpt", required=True, help="official sam3.pt")
 ap.add_argument("--out", required=True); ap.add_argument("--buckets", default="4,1", help="prompt buckets K to export"); ap.add_argument("--qsel", type=int, default=32, help="queries per prompt fed to the mask head")
-ap.add_argument("--threads", type=int, default=16); ap.add_argument("--fused", action="store_true", help="also export groundmask_cK: grounding head + in-graph top-Q query selection + segmentation head in one static graph (fpn_0/1/2 bound to the backbone buffers, img_pos baked in)"); ap.add_argument("--phase-conv", action="store_true", help="exact rewrite of conv3x3(fpn + nearest_up2(x)) as conv3x3(fpn) once per image plus four 2x2 phase convolutions at half resolution"); ap.add_argument("--only-mask", action="store_true"); args = ap.parse_args()
+ap.add_argument("--threads", type=int, default=16); ap.add_argument("--shared-encoder", action="store_true", help="also export groundmaskse_cK: the fused head with ONE encoder pass at batch 1 conditioned on a generic prompt (inputs gen_feats [32,1,256], gen_mask [1,32]) and the decoder per prompt on the shared memory; approximate (the encoder no longer sees each prompt), ~(K-1)/K of the encoder cost saved"); ap.add_argument("--u8-masks", action="store_true", help="also export groundmaskU8_cK: the fused head reduced to what the model-server postprocessing needs: scores [K,200,1] fp16, boxes [K,200,4] fp16 (normalised cxcywh, DETR head; only used by the boxes-only path), sel [K,Q] int64 and masks_u8 [K,Q,288,288] uint8 (mask logit > 0, i.e. sigmoid > 0.5, thresholded on the GPU); no presence / hs outputs"); ap.add_argument("--fused", action="store_true", help="also export groundmask_cK: grounding head + in-graph top-Q query selection + segmentation head in one static graph (fpn_0/1/2 bound to the backbone buffers, img_pos baked in)"); ap.add_argument("--phase-conv", action="store_true", help="exact rewrite of conv3x3(fpn + nearest_up2(x)) as conv3x3(fpn) once per image plus four 2x2 phase convolutions at half resolution"); ap.add_argument("--only-mask", action="store_true"); args = ap.parse_args()
 DART = args.dart; CKPT = args.ckpt; OUT = Path(args.out); BUCKETS = [int(k) for k in args.buckets.split(",")]; QSEL = args.qsel
 sys.path.insert(0, DART)
 import torch
@@ -56,6 +56,23 @@ class GroundingWrapper(torch.nn.Module):
         boxes = (inverse_sigmoid(reference_boxes[-1]) + box_offsets).sigmoid(); presence_last = presence[-1].permute(1, 0)
         return scores.to(torch.float16), boxes.to(torch.float16), presence_last.to(torch.float16), hidden_last[0].to(torch.float16), memory["memory"].to(torch.float16)
 
+class SharedGroundingWrapper(GroundingWrapper):
+    """Shared-encoder grounding: encoder once at batch 1 with a generic prompt (gen_feats/gen_mask), decoder + scoring per prompt (text_feats/text_mask [K]) on the expanded memory."""
+    def forward(self, img_feat, img_pos, gen_feats, gen_mask, text_feats, text_mask):
+        K = text_mask.shape[0]; img_feat = img_feat.to(torch.float32); img_pos = img_pos.to(torch.float32); gf = gen_feats.to(torch.float32); gm = gen_mask.to(torch.bool)
+        tf = text_feats.to(torch.float32); tm = text_mask.to(torch.bool)
+        img_seq = img_feat.flatten(2).permute(2, 0, 1); pos_seq = img_pos.flatten(2).permute(2, 0, 1)
+        memory = self.encoder(src=[img_seq], src_key_padding_mask=None, src_pos=[pos_seq], prompt=gf, prompt_key_padding_mask=gm, feat_sizes=[(72, 72)])
+        mem = memory["memory"].expand(-1, K, -1); pos = memory["pos_embed"].expand(-1, K, -1); vr = memory["valid_ratios"].expand(K, -1, -1)
+        pm = memory["padding_mask"]; pm = pm.expand(K, -1) if pm is not None else None
+        target = self.decoder.query_embed.weight.unsqueeze(1).expand(-1, K, -1)
+        hidden, reference_boxes, presence, _ = self.decoder(tgt=target, memory=mem, memory_key_padding_mask=pm, pos=pos, reference_boxes=None, level_start_index=memory["level_start_index"],
+            spatial_shapes=memory["spatial_shapes"], valid_ratios=vr, tgt_mask=None, memory_text=tf, text_attention_mask=tm, apply_dac=False)
+        hidden = hidden.transpose(1, 2); reference_boxes = reference_boxes.transpose(1, 2); hidden_last = hidden[-1:]
+        scores = self.scoring(hidden_last, tf, tm)[0]; box_offsets = self.decoder.bbox_embed(hidden_last)[0]
+        boxes = (inverse_sigmoid(reference_boxes[-1]) + box_offsets).sigmoid(); presence_last = presence[-1].permute(1, 0)
+        return scores.to(torch.float16), boxes.to(torch.float16), presence_last.to(torch.float16), hidden_last[0].to(torch.float16), mem.to(torch.float16)
+
 class PhasePixelDecoder(torch.nn.Module):
     """Exact rewrite of PixelDecoder.forward. For each level: conv3x3(fpn + up2(prev)) = conv3x3(fpn) + conv3x3(up2(prev)); the second term on a
     nearest-upsampled input equals, for output phase (p, q), a 2x2 convolution of prev with the 3x3 taps merged pairwise and an asymmetric pad
@@ -105,6 +122,17 @@ class FusedWrapper(torch.nn.Module):
         out = self.seg(backbone_feats=[fpn_0.to(torch.float32), fpn_1.to(torch.float32), torch.zeros((1, 256, 72, 72), dtype=torch.float32)], obj_queries=hs_sel.to(torch.float32).unsqueeze(0),
                        image_ids=torch.zeros((K,), dtype=torch.long), encoder_hidden_states=enc.to(torch.float32), prompt=tf, prompt_mask=tm)
         return scores, boxes, presence, hs, sel, out["pred_masks"].to(torch.float16)
+class SharedFusedWrapper(FusedWrapper):
+    """FusedWrapper with the shared encoder: fpn_0/1/2, text_feats [32,K,256], text_mask [K,32], gen_feats [32,1,256], gen_mask [1,32] -> same outputs."""
+    def forward(self, fpn_0, fpn_1, fpn_2, text_feats, text_mask, gen_feats, gen_mask):
+        K = text_mask.shape[0]
+        scores, boxes, presence, hs, enc = self.ground(fpn_2.to(torch.float32), self.img_pos, gen_feats, gen_mask, text_feats, text_mask)
+        probs = torch.sigmoid(scores.to(torch.float32)[:, :, 0]) * torch.sigmoid(presence.to(torch.float32)[:, 0])[:, None]
+        sel = probs.topk(self.Q, dim=1).indices; hs_sel = torch.gather(hs, 1, sel[..., None].expand(-1, -1, hs.shape[-1]))
+        tf = text_feats.to(torch.float32); tm = text_mask.to(torch.bool)
+        out = self.seg(backbone_feats=[fpn_0.to(torch.float32), fpn_1.to(torch.float32), torch.zeros((1, 256, 72, 72), dtype=torch.float32)], obj_queries=hs_sel.to(torch.float32).unsqueeze(0),
+                       image_ids=torch.zeros((K,), dtype=torch.long), encoder_hidden_states=enc.to(torch.float32), prompt=tf, prompt_mask=tm)
+        return scores, boxes, presence, hs, sel, out["pred_masks"].to(torch.float16)
 decoder = model.transformer.decoder; decoder.compile_mode = None; decoder.compiled = True
 ch, cw = decoder._get_coords(72, 72, device="cpu"); decoder.compilable_cord_cache = (ch, cw); decoder.compilable_stored_size = (72, 72)
 wrapper = GroundingWrapper(model.transformer.encoder, decoder, model.dot_prod_scoring).cpu().eval()
@@ -142,4 +170,28 @@ if args.fused:
             torch.onnx.export(fw, finp, str(OUT / f"groundmask_c{K}_q{QSEL}{suffix}.onnx"), opset_version=17, input_names=["fpn_0", "fpn_1", "fpn_2", "text_feats", "text_mask"],
                               output_names=["scores", "boxes", "presence", "hs", "sel", "masks"], dynamic_axes=None, do_constant_folding=True, dynamo=False)
         print("exported groundmask_c%d %.0fs" % (K, time.time() - t0), flush=True)
+if args.shared_encoder:
+    swrapper = SharedGroundingWrapper(model.transformer.encoder, decoder, model.dot_prod_scoring).cpu().eval()
+    for K in BUCKETS:
+        fw = SharedFusedWrapper(swrapper, seg, img_pos1, QSEL).cpu().eval()
+        finp = (torch.zeros((1, 256, 288, 288)), torch.zeros((1, 256, 144, 144)), torch.zeros((1, 256, 72, 72)), torch.zeros((32, K, 256), dtype=torch.float16), torch.zeros((K, 32)),
+                torch.zeros((32, 1, 256), dtype=torch.float16), torch.zeros((1, 32)))
+        with torch.inference_mode():
+            outs = fw(*finp); print("groundmaskse_c%d shapes:" % K, [tuple(o.shape) for o in outs], flush=True)
+            torch.onnx.export(fw, finp, str(OUT / f"groundmaskse_c{K}_q{QSEL}{suffix}.onnx"), opset_version=17, input_names=["fpn_0", "fpn_1", "fpn_2", "text_feats", "text_mask", "gen_feats", "gen_mask"],
+                              output_names=["scores", "boxes", "presence", "hs", "sel", "masks"], dynamic_axes=None, do_constant_folding=True, dynamo=False)
+        print("exported groundmaskse_c%d %.0fs" % (K, time.time() - t0), flush=True)
+if args.u8_masks:
+    class FusedU8Wrapper(FusedWrapper):
+        def forward(self, *xs):
+            scores, boxes, presence, hs, sel, masks = super().forward(*xs)
+            return scores, boxes, sel, (masks > 0).to(torch.uint8)
+    for K in BUCKETS:
+        fw = FusedU8Wrapper(wrapper, seg, img_pos1.repeat(K, 1, 1, 1), QSEL).cpu().eval()
+        finp = (torch.zeros((1, 256, 288, 288)), torch.zeros((1, 256, 144, 144)), torch.zeros((1, 256, 72, 72)), torch.zeros((32, K, 256), dtype=torch.float16), torch.zeros((K, 32)))
+        with torch.inference_mode():
+            outs = fw(*finp); print("groundmaskU8_c%d shapes:" % K, [(tuple(o.shape), str(o.dtype)) for o in outs], flush=True)
+            torch.onnx.export(fw, finp, str(OUT / f"groundmaskU8_c{K}_q{QSEL}{suffix}.onnx"), opset_version=17, input_names=["fpn_0", "fpn_1", "fpn_2", "text_feats", "text_mask"],
+                              output_names=["scores", "boxes", "sel", "masks_u8"], dynamic_axes=None, do_constant_folding=True, dynamo=False)
+        print("exported groundmaskU8_c%d %.0fs" % (K, time.time() - t0), flush=True)
 print("EXPORT_DONE")

@@ -1,6 +1,6 @@
 """Small TensorRT 10 Python helpers shared by the W8A8 tooling on the Orin."""
 import numpy as np, tensorrt as trt, ctypes, os, json, time
-from cuda_alloc import DevBuf  # thin cudart wrapper (see cuda_alloc.py)
+from cuda_alloc import DevBuf, memcpy_d2d  # thin cudart wrapper (see cuda_alloc.py)
 
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 NP_DTYPE = {trt.float32: np.float32, trt.float16: np.float16, trt.int8: np.int8, trt.int32: np.int32, trt.bool: np.bool_}
@@ -47,6 +47,9 @@ class Runner:
         feeds = {self._res(k): v for k, v in feeds.items()}
         for n in self.inputs:
             buf, shape, dt = self.bufs[n]
+            if hasattr(feeds[n], "data_ptr"):      # torch CUDA tensor already in the engine dtype/shape: device-to-device, no host round trip
+                x = feeds[n]; assert x.is_cuda and x.is_contiguous() and tuple(x.shape) == shape and x.element_size() == np.dtype(dt).itemsize, (n, tuple(x.shape), shape)
+                memcpy_d2d(buf.ptr, x.data_ptr(), x.numel() * x.element_size()); continue
             x = np.ascontiguousarray(feeds[n], dtype=dt); assert x.shape == shape, (n, x.shape, shape)
             buf.upload(x)
         ok = self.ctx.execute_v2([self.bufs[n][0].ptr for n in self.names]); assert ok
